@@ -27,7 +27,7 @@ int database_create(const char *db_path, const char *table, const char *schema)
     {
         fprintf(stderr,"Can't open database: %s\n",sqlite3_errmsg(db));
         sqlite3_close(db);
-        return 1;
+        return -1;
     }
 
     //创建SQL表
@@ -40,7 +40,7 @@ int database_create(const char *db_path, const char *table, const char *schema)
         fprintf(stderr,"SQL error: %s\n",err_msg);
         sqlite3_free(err_msg);
         sqlite3_close(db);
-        return 1;
+        return -1;
     }
 
     printf("Table created or already exists\n");
@@ -62,7 +62,7 @@ int database_insert(const char *db_path, const char *table, const char *columns,
     {
         fprintf(stderr,"Can't open database: %s\n",sqlite3_errmsg(db));
         sqlite3_close(db);
-        return 1;
+        return -1;
     }
 
     snprintf(sql, sizeof(sql), "INSERT INTO %s(%s) VALUES(%s);", table, columns, value);
@@ -74,7 +74,7 @@ int database_insert(const char *db_path, const char *table, const char *columns,
         fprintf(stderr,"SQL error: %s\n",err_msg);
         sqlite3_free(err_msg);
         sqlite3_close(db);
-        return 1;
+        return -1;
     }
 
     printf("Insert Successfully\n");
@@ -96,7 +96,7 @@ int database_select(const char *db_path, const char *table, const char *columns,
     {
         fprintf(stderr,"Can't open database: %s\n",sqlite3_errmsg(db));
         sqlite3_close(db);
-        return 1;
+        return -1;
     }
 
     if(columns == NULL)
@@ -119,7 +119,7 @@ int database_select(const char *db_path, const char *table, const char *columns,
         fprintf(stderr,"SQL error: %s\n",err_msg);
         sqlite3_free(err_msg);
         sqlite3_close(db);
-        return 1;
+        return -1;
     }
 
     printf("Select Successfully\n");
