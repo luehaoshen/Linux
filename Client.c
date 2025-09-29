@@ -66,7 +66,7 @@ int main(int argc, char* argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	printf("已使用IP：%s连接到服务器，输入发送数据（输入“quit”退出）：\n", local_ip);
+	printf("已使用IP：%s连接到服务器，输入发送数据（输入“quit”退出，输入“select”查询记录）：\n", local_ip);
 
 	while (1)
 	{
@@ -76,16 +76,28 @@ int main(int argc, char* argv[])
 			break;
 		}
 		
+		buf[strcspn(buf,"\n")] = '\0';
 		if (send(sock, buf, strlen(buf), 0) == -1)
 		{
 			perror("send failed");
 			break;
 		}
-		
-		buf[strcspn(buf,"\n")] = '\0';
+
+		if(strcmp(buf,"select") == 0)
+		{
+			int len = recv(sock, buf, BUFFER_SIZE - 1, 0);
+			if(len > 0)
+			{
+				buf[len] = '\0';
+				printf("查询结果:\n%s\n", buf);
+			}
+		    continue;
+		}
+
+		//buf[strcspn(buf,"\n")] = '\0';
 		if(strcmp(buf,"quit") == 0)
 		{
-		        break;
+		    break;
 		}
 	}
 
