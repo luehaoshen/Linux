@@ -1,166 +1,150 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dbus/dbus.h>
+#include <systemd/sd-bus.h>
 #include <sqlite3.h> 
+#include <errno.h>
 #include "Database.h"
 
-#define SERVICE_NAME "com.example.DBService"
-#define OBJECT_PATH "/com/example/DBService"
-#define INTERFACE_NAME "com.example.DBService"
+#define SERVICE_NAME "com.example.sdbusService"
+#define OBJECT_PATH "/com/example/sdbusService"
+#define INTERFACE_NAME "com.example.sdbusService.Manager"
 
-static const DBusObjectPathVTable object_vtable =
-{
-    .message_function = message_filter
-};
+#define MAX_RESULT_LEN 4096
 
-static void send_error_reply(DBusConnection *conn, DBusMessage *msg, const char *error_name, const char *error_msg)
+static int handle_insert(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
 {
-    DBusMessage *reply = dbus_message_new_error(msg, error_name, error_msg);
-    if(reply)
+    const char *client_ip, *recv_data, *send_data;
+    int r;
+    
+    r = sd_bus_message_read(m, "sss", &client_ip, &recv_data, &send_data);
+    if(r < 0)
     {
-        dbus_connection_send(conn, reply, NULL);
-        dbus_message_unref(reply);
-    }
-}
-
-static DBusHandlerResult handle_insert(DBusConnection *conn, DBusMessage *msg)
-{
-    char *client_ip, *recv_data, *send_data;
-
-    printf("Start InsertData\n");
-
-    if(!dbus_message_get_args(msg, NULL,
-                              DBUS_TYPE_STRING, &client_ip,
-                              DBUS_TYPE_STRING, &recv_data,
-                              DBUS_TYPE_STRING, &send_data,
-                              DBUS_TYPE_INVALID))
-    {
-        send_error_reply(conn, msg, DBUS_ERROR_INVALID_ARGS, "无效的参数");
-        return DBUS_HANDLER_RESULT_HANDLED;
+        sd_bus_error_setf(ret_error, SD_BUS_ERROR_INVALID_ARGS, "Can't parse permanent:%s", strerror(-r));
+        return r;
     }
 
     char *values = sqlite3_mprintf("'%s', '%s', '%s', datetime('now')", client_ip, recv_data, send_data);
+    
     if(!values)
     {
-        send_error_reply(conn, msg, DBUS_ERROR_INVALID_ARGS, "内存分配失败");
-        return DBUS_HANDLER_RESULT_HANDLED;
+        sd_bus_error_set(ret_error, SD_BUS_ERROR_NO_MEMORY, "Memory allocation failed");
+        return -ENOMEM;
     }
 
-    int ret = database_insert("server_data.db", "communication",
-                              "client_ip, received_data, send_data, timestamp",
-                               values);
+    int db_ret = database_insert("server_data.db", "communication",
+                                 "client_ip, received_data, send_data, timestamp",
+                                 values);
     
     sqlite3_free(values);
 
-    DBusMessage *reply = dbus_message_new_method_return(msg);
-    if(reply)
-    {
-        dbus_message_append_args(reply, DBUS_TYPE_INT32, &ret, DBUS_TYPE_INVALID);
-        dbus_connection_send(conn, reply, NULL);
-        dbus_connection_flush(conn);
-        dbus_message_unref(reply);
-    }
-
-    return DBUS_HANDLER_RESULT_HANDLED;
+    return sd_bus_reply_method_return(m, "i", db_ret);
 }
 
-static DBusHandlerResult handle_select(DBusConnection *conn, DBusMessage *msg)
+static int handle_select(sd_bus_message *m, void *userdata, sd_bus_error *ret_error)
 {
-    char *condition;
-    char result[4096] = {0};
-
-    if(!dbus_message_get_args(msg, NULL,
-                              DBUS_TYPE_STRING, &condition,
-                              DBUS_TYPE_INVALID))
-    {
-        send_error_reply(conn, msg, DBUS_ERROR_INVALID_ARGS, "无效的参数");
-        return DBUS_HANDLER_RESULT_HANDLED;
-    }
-
-    int ret = database_select("server_data.db", "communication",
-                              "client_ip, received_data, send_data, timestamp",
-                               condition);
-
-    DBusMessage *reply = dbus_message_new_method_return(msg);
-    if(reply)
-    {
-        dbus_message_append_args(reply, 
-                                 DBUS_TYPE_INT32, &ret, 
-                                 DBUS_TYPE_STRING, &result, 
-                                 DBUS_TYPE_INVALID);
-        dbus_connection_send(conn, reply, NULL);
-        dbus_connection_flush(conn);
-        dbus_message_unref(reply);
-    }
+    char *result = NULL;
+    char *condition = NULL;
     
-    return DBUS_HANDLER_RESULT_HANDLED;
+    int r =sd_bus_message_read(m, "s", &condition);
+    if(r < 0)
+    {
+        sd_bus_error_setf(ret_error, SD_BUS_ERROR_INVALID_ARGS, "Parse condition failed:%s", strerror(-r));
+        return r;
+    }
+
+    int db_ret = database_select("server_data.db",
+                                 "communication",
+                                 "*",
+                                 condition,
+                                 &result,
+                                 MAX_RESULT_LEN);
+    
+
+    if(db_ret != 0)
+    {
+        const char *err_msg = "select failed";
+        if(result)
+        {
+            err_msg = result;
+            free(result);
+            result = NULL;
+        }
+        sd_bus_error_setf(ret_error, SD_BUS_ERROR_FAILED, "%s", err_msg);
+        return -1;
+    }
+
+    r = sd_bus_reply_method_return(m, "s", result);
+    free(result);
+    return r;
 }
 
-static DBusHandlerResult message_filter(DBusConnection *conn, DBusMessage *msg, void *user_data)
+static const sd_bus_vtable service_vtable[] = 
 {
-    printf("receive message: port=%s, method=%s\n", dbus_message_get_interface(msg), dbus_message_get_member(msg));
-    if(dbus_message_is_method_call(msg, INTERFACE_NAME, "InsertData"))
-    {
-        return handle_insert(conn, msg);
-    }
-    if(dbus_message_is_method_call(msg, INTERFACE_NAME, "SelectData"))
-    {
-        return handle_select(conn, msg);
-    }
-    return DBUS_HANDLER_RESULT_HANDLED;
-}
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_METHOD("InsertData", "sss", "i", handle_insert, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD("SelectData", "s", "s", handle_select, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_VTABLE_END
+};
 
 int main()
 {
-    DBusError err;
-    DBusConnection *conn;
-    int ret;
+    sd_bus *bus = NULL;
+    sd_bus_slot *slot = NULL;
+    int r;
 
-    dbus_error_init(&err);
-
-    conn = dbus_bus_get(DBUS_BUS_SESSION, &err);
-    if(dbus_error_is_set(&err))
+    r = sd_bus_open_user(&bus);
+    if(r < 0)
     {
-        fprintf(stderr, "D-bus连接失败: %s\n", err.message);
-        dbus_error_free(&err);
-        return -1;
+        fprintf(stderr, "Can't connect to the session bus:%s\n", strerror(-r));
+        goto finish;
     }
 
-    ret = dbus_bus_request_name(conn, SERVICE_NAME, DBUS_NAME_FLAG_REPLACE_EXISTING, &err);
-    if(dbus_error_is_set(&err))
+    r = sd_bus_add_object_vtable(bus, &slot, OBJECT_PATH, INTERFACE_NAME, service_vtable, NULL);
+    if(r < 0)
     {
-        fprintf(stderr, "注册服务器名失败: %s\n", err.message);
-        dbus_error_free(&err);
-        return -1;
+        fprintf(stderr, "Can't add object vtable:%s\n",strerror(-r));
+        goto finish;
     }
 
-    dbus_connection_add_filter(conn, message_filter, NULL, NULL);
-    if(!dbus_connection_register_object_path(conn, OBJECT_PATH, &object_vtable, NULL))
+    r = sd_bus_request_name(bus, SERVICE_NAME, 0);
+    if(r < 0)
     {
-        fprintf(stderr,"register object path failed\n");
-        return -1;
+        fprintf(stderr, "Can't request service name:%s\n",strerror(-r));
+        goto finish;
     }
 
     database_create("server_data.db", "communication",
-                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                    "client_ip TEXT NOT NULL, "
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "          
+                    "client_ip TEXT NOT NULL, " 
                     "received_data TEXT, "
                     "send_data TEXT, "
-                    "timestamp DATETIME");
+                    "timestamp DATATIME");
 
-    printf("D-Bus数据库服务启动成功\n");
-    while(1)
+    for(;;)
     {
-        dbus_connection_read_write(conn, -1);
-        DBusMessage *msg = dbus_connection_pop_message(conn);
-        if(msg)
+        r = sd_bus_process(bus, NULL);
+        if(r < 0)
         {
-            dbus_connection_dispatch(conn);
-            dbus_message_unref(msg);
+            fprintf(stderr, "Deal with message from session bus failed:%s\n",strerror(-r));
+            goto finish;
+        }
+
+        if(r > 0)
+        {
+            continue;
+        }
+
+        r = sd_bus_wait(bus, (uint64_t) -1);
+        if(r < 0)
+        {
+            fprintf(stderr, "Wait for message from session bus failed:%s\n",strerror(-r));
+            goto finish;
         }
     }
 
-    dbus_connection_unref(conn);
-    return 0;
+    finish:
+        sd_bus_slot_unref(slot);
+        sd_bus_unref(bus);
+        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
