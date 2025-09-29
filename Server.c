@@ -7,72 +7,76 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <dbus/dbus.h>
+#include <systemd/sd-bus.h>
 
 #define PORT 8888
 #define BUFFER_SIZE 1024
 
-#define DBUS_SERVICE "com.example.DBService"
-#define DBUS_PATH "/com/example/DBService"
-#define DBUS_INTERFACE "com.example.DBService"
+#define SDBUS_SERVICE "com.example.sdbusService"
+#define SDBUS_PATH "/com/example/sdbusService"
+#define SDBUS_INTERFACE "com.example.sdbusService.Manager"
 
-DBusConnection *dbus_init()
+static sd_bus *sd_bus_init()
 {
-	DBusError err;
-	dbus_error_init(&err);
-	DBusConnection *conn = dbus_bus_get(DBUS_BUS_SESSION, &err);
-	if(dbus_error_is_set(&err))
+	sd_bus *bus = NULL;
+	int r = sd_bus_open_user(&bus);
+	if(r < 0)
 	{
-		fprintf(stderr, "D-Bus客户端连接失败: %s\n", err.message);
-		dbus_error_free(&err);
+		fprintf(stderr, "sd-bus connected failed:%s\n", strerror(r));
 		return NULL;
 	}
-	return conn;
+	return bus;
 }
 
-void dbus_insert_data(DBusConnection *conn, const char *ip, const char *recv_data, const char *send_data)
+static void sd_bus_insert_data(sd_bus *bus, const char *ip, const char *recv_data, const char *send_data)
 {
-    if(!conn) return;
-    DBusMessage *msg = dbus_message_new_method_call(DBUS_SERVICE, DBUS_PATH, DBUS_INTERFACE, "InsertData");
-	
-    if(!msg)
-    {
-        fprintf(stderr, "创建D-Bus消息失败");
-        return;
-    }
-
-    dbus_message_append_args(msg, 
-							 DBUS_TYPE_STRING, &ip,
-							 DBUS_TYPE_STRING, &recv_data,
-							 DBUS_TYPE_STRING, &send_data,
-							 DBUS_TYPE_INVALID);
-	
-	DBusMessage *reply = dbus_connection_send_with_reply_and_block(conn, msg, -1, NULL);
-	if(reply)
+    if(!bus) 
 	{
-		int ret;
-		if(dbus_message_get_args(reply, NULL, DBUS_TYPE_INT32, &ret, DBUS_TYPE_INVALID))
-		{
-			if(ret != 0)
-			{
-				printf("数据库采集失败，返回值: %d", ret);
-			}
-		}
-		dbus_message_unref(reply);
+		return;
 	}
-	else
+	sd_bus_error error = SD_BUS_ERROR_NULL;
+	sd_bus_message *msg = NULL;
+    int ret;
+	int r;
+	
+    r = sd_bus_call_method(
+							bus,
+							SDBUS_SERVICE,
+							SDBUS_PATH,
+							SDBUS_INTERFACE,
+							"InsertData",
+							&error,
+							&msg,
+							"sss",
+							ip,
+							recv_data,
+							send_data
+						  );
+	if(r < 0)
 	{
-		fprintf(stderr, "未收到D-Bus服务的回复\n");
+		fprintf(stderr, "call InsertData failed:%s\n",error.message);
+		sd_bus_error_free(&error);
+		return;
 	}
 
-	dbus_message_unref(msg);
+	r = sd_bus_message_read(msg, "i", &ret);
+	if(r < 0)
+	{
+		fprintf(stderr, "failed to parse the return result:%s\n",strerror(-r));
+		return;
+	}
+
+	if(ret != 0)
+	{
+		printf("Database insert failed");
+	}
 }
 
 typedef struct
 {
 	int client_sock;
 	struct sockaddr_in client_addr;
-	DBusConnection *dbus_conn;
+	sd_bus *bus;
 }ClientData;
 
 void* new_thread(void* arg)
@@ -97,10 +101,50 @@ void* new_thread(void* arg)
 	    recv_buffer[len] = '\0';
 	    printf("收到客户端%s数据:%s\n", client_ip, recv_buffer);
 
-		strcpy(send_buffer, "received sucessfully!");
-		send(client_sock, send_buffer, strlen(send_buffer), 0);
+		if(strncmp(recv_buffer, "select", 6) == 0)
+		{
+			sd_bus_error error = SD_BUS_ERROR_NULL;
+			sd_bus_message *reply = NULL;
+			const char *result = NULL;
+			const char *condition = NULL;
 
-		dbus_insert_data(data->dbus_conn, client_ip, recv_buffer, send_buffer);
+			char *where_pos = strstr(recv_buffer, "where");
+			if(where_pos != NULL)
+			{
+				condition = where_pos + 5;
+				while(*condition == ' ')
+				{
+					condition++;
+				}
+			}
+
+			int r = sd_bus_call_method(
+									   data->bus,
+									   SDBUS_SERVICE,
+									   SDBUS_PATH,
+									   SDBUS_INTERFACE,
+									   "SelectData",
+									   &error,
+									   &reply,
+									   "s",
+									   condition);
+
+			if(r < 0)
+			{
+				snprintf(send_buffer, BUFFER_SIZE, "select failed:%s", error.message);
+				sd_bus_error_free(&error);
+			}
+			else
+			{
+				sd_bus_message_read(reply, "s", &result);
+				strncpy(send_buffer, result ? result : "no data", BUFFER_SIZE - 1);
+				sd_bus_message_unref(reply);
+			}
+			send(client_sock, send_buffer, strlen(send_buffer), 0);
+			continue;
+		}
+
+		sd_bus_insert_data(data->bus, client_ip, recv_buffer, send_buffer);
 
 		if (strcmp(recv_buffer, "quit") == 0)
 		{
@@ -120,8 +164,8 @@ int main()
 	socklen_t client_addrlen;
 	int opt = 1;
 
-	DBusConnection *dbus_conn = dbus_init();
-	if(!dbus_conn)
+	sd_bus *bus = sd_bus_init();
+	if(!bus)
 	{
 		exit(EXIT_FAILURE);
 	}
@@ -185,7 +229,7 @@ int main()
 			}
 	        data->client_sock = client_sock;
 	        data->client_addr = client_addr;
-			data->dbus_conn = dbus_conn;
+			data->bus = bus;
 	        pthread_t id;
 	        if (pthread_create(&id, NULL, new_thread, (void*)data) != 0)
 	        {
@@ -200,6 +244,6 @@ int main()
 	}
 
 	close(server_sock);
-	dbus_connection_unref(dbus_conn);
+	sd_bus_unref(bus);
 	return 0;
 }
